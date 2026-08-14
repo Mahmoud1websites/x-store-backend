@@ -10,7 +10,7 @@
  *
  *   products(id, supplier_product_id, name, category_name, your_price,
  *            supplier_price, product_type, qty_values_json, params_json,
- *            available, updated_at)
+ *            is_listed, available, updated_at)
  *   orders(id, user_id, product_id, order_uuid, supplier_order_id,
  *          qty, params_json, status, your_price, supplier_price,
  *          created_at, updated_at)
@@ -84,6 +84,7 @@ async function creditWallet(userId, amount) {
 
 async function upsertProducts(productList) {
   for (const p of productList) {
+    const existing = products.get(String(p.id));
     products.set(String(p.id), {
       supplier_product_id: p.id,
       name: p.name,
@@ -93,6 +94,7 @@ async function upsertProducts(productList) {
       product_type: p.product_type,
       qty_values: p.qty_values,
       params: p.params,
+      is_listed: existing?.is_listed ?? false,
       available: p.available,
       updated_at: new Date().toISOString(),
     });
@@ -111,12 +113,25 @@ async function listProducts() {
 // ---- Orders ----
 
 async function createOrder(order) {
+  const duplicate = Array.from(orders.values()).find(
+    (existing) =>
+      existing.user_id === order.user_id &&
+      existing.client_request_id === order.client_request_id
+  );
+  if (duplicate) return duplicate;
   orders.set(order.order_uuid, {
     ...order,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
   return orders.get(order.order_uuid);
+}
+
+async function getOrderByClientRequest(userId, clientRequestId) {
+  return Array.from(orders.values()).find(
+    (order) =>
+      order.user_id === userId && order.client_request_id === clientRequestId
+  ) || null;
 }
 
 async function getOrderByUuid(orderUuid) {
@@ -135,6 +150,12 @@ async function listOrdersByStatus(status) {
   return Array.from(orders.values()).filter((o) => o.status === status);
 }
 
+async function listOrdersByStatuses(statuses) {
+  return Array.from(orders.values()).filter((order) =>
+    statuses.includes(order.status)
+  );
+}
+
 async function listOrdersByUser(userId) {
   return Array.from(orders.values())
     .filter((order) => order.user_id === userId)
@@ -146,9 +167,11 @@ module.exports = {
   getProduct,
   listProducts,
   createOrder,
+  getOrderByClientRequest,
   getOrderByUuid,
   updateOrder,
   listOrdersByStatus,
+  listOrdersByStatuses,
   listOrdersByUser,
   createUser,
   getUserByEmail,

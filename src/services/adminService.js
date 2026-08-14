@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const supabase = require('../db/supabaseClient');
 const catalogService = require('./catalogService');
 const supplierApi = require('./supplierApi');
+const pricingService = require('./pricingService');
 
 const SETTINGS_ID = 1;
 const IMAGE_BUCKET = process.env.SUPABASE_IMAGE_BUCKET || 'x-store-images';
@@ -82,10 +83,19 @@ function enrichOrders(orders, users, products) {
 
 async function getOverview() {
   const { users, products, orders } = await loadDashboardData();
+  const { count: pendingWalletRequests, error: walletError } = await supabase
+    .from('wallet_topup_requests')
+    .select('id', { count: 'exact', head: true })
+    .eq('status', 'pending');
+  fail(walletError, 'count pending wallet requests');
   const fulfilledStatuses = new Set(['accept', 'completed']);
   const revenue = orders
     .filter((order) => fulfilledStatuses.has(String(order.status).toLowerCase()))
     .reduce((sum, order) => sum + Number(order.your_price || order.total || 0), 0);
+  const supplierCost = orders
+    .filter((order) => fulfilledStatuses.has(String(order.status).toLowerCase()))
+    .reduce((sum, order) => sum + Number(order.supplier_price || 0), 0);
+  const grossProfit = pricingService.roundPrice(revenue - supplierCost);
 
   let supplier;
   try {
@@ -97,9 +107,15 @@ async function getOverview() {
 
   return {
     revenue,
+    supplierCost,
+    grossProfit,
+    grossMarginPercent: revenue > 0
+      ? pricingService.roundPrice((grossProfit / revenue) * 100)
+      : 0,
     orders: orders.length,
     users: users.length,
-    products: products.filter((product) => !product.archived).length,
+    products: products.filter((product) => product.is_listed && !product.archived).length,
+    pendingWalletRequests: pendingWalletRequests || 0,
     recentOrders: enrichOrders(orders.slice(0, 8), users, products),
     supplier,
   };
@@ -107,17 +123,20 @@ async function getOverview() {
 
 async function listProducts(search) {
   const term = cleanSearch(search);
-  const { data, error } = await supabase
-    .from('products')
-    .select('*')
-    .order('updated_at', { ascending: false });
-  fail(error, 'list products');
-  return (data || []).filter((product) => {
+  const [productsResult, settings] = await Promise.all([
+    supabase.from('products').select('*').order('updated_at', { ascending: false }),
+    getSettings(),
+  ]);
+  fail(productsResult.error, 'list products');
+  return (productsResult.data || []).filter((product) => {
     if (product.archived) return false;
     if (!term) return true;
     return [product.name, product.category_name, product.supplier_product_id]
       .some((value) => String(value || '').toLowerCase().includes(term));
-  });
+  }).map((product) => pricingService.enrichProductPricing(
+    product,
+    settings.default_markup_percent,
+  ));
 }
 
 async function findProduct(identifier) {
@@ -141,13 +160,9 @@ async function findProduct(identifier) {
 
 function productPatch(input) {
   const patch = {};
-  const fields = ['name', 'category_name', 'available', 'supplier_product_id'];
+  const fields = ['name', 'category_name', 'available', 'is_listed', 'supplier_product_id'];
   for (const field of fields) {
     if (input[field] !== undefined) patch[field] = input[field];
-  }
-  if (input.your_price !== undefined) {
-    patch.your_price = Number(input.your_price);
-    patch.price_overridden = true;
   }
   if (input.image_url !== undefined) {
     patch.image_url = input.image_url || null;
@@ -169,9 +184,12 @@ async function createProduct(adminId, input) {
     qty_values: null,
     params: {},
     available: input.available !== false,
+    is_listed: input.is_listed !== false,
     image_url: input.image_url || null,
     category_img: input.image_url || null,
     price_overridden: true,
+    pricing_mode: pricingService.PRICING_MODES.FIXED,
+    custom_markup_percent: null,
     image_overridden: Boolean(input.image_url),
     archived: false,
     updated_at: new Date().toISOString(),
@@ -185,6 +203,44 @@ async function createProduct(adminId, input) {
 async function updateProduct(adminId, identifier, input) {
   const { product, column } = await findProduct(identifier);
   const patch = productPatch(input);
+  const pricingTouched = input.pricing_mode !== undefined
+    || input.custom_markup_percent !== undefined
+    || input.your_price !== undefined;
+
+  let settings;
+  if (pricingTouched) {
+    settings = await getSettings();
+    let pricingMode = input.pricing_mode || pricingService.normalizePricingMode(product);
+    if (input.your_price !== undefined && input.pricing_mode === undefined) {
+      pricingMode = pricingService.PRICING_MODES.FIXED;
+    }
+    if (input.custom_markup_percent !== undefined && input.pricing_mode === undefined) {
+      pricingMode = pricingService.PRICING_MODES.PERCENTAGE;
+    }
+    if (product.product_type === 'manual' && pricingMode !== pricingService.PRICING_MODES.FIXED) {
+      const error = new Error('Manual products must use a fixed customer price');
+      error.status = 400;
+      error.code = 'MANUAL_PRODUCT_FIXED_PRICE_REQUIRED';
+      throw error;
+    }
+
+    const customMarkup = input.custom_markup_percent !== undefined
+      ? input.custom_markup_percent
+      : product.custom_markup_percent;
+    const customerPrice = pricingService.calculateCustomerPrice({
+      supplierPrice: product.supplier_price,
+      pricingMode,
+      globalMarkupPercent: settings.default_markup_percent,
+      customMarkupPercent: customMarkup,
+      fixedPrice: input.your_price !== undefined ? input.your_price : product.your_price,
+    });
+    patch.pricing_mode = pricingMode;
+    patch.custom_markup_percent = pricingMode === pricingService.PRICING_MODES.PERCENTAGE
+      ? Number(customMarkup)
+      : null;
+    patch.your_price = customerPrice;
+    patch.price_overridden = pricingMode !== pricingService.PRICING_MODES.GLOBAL;
+  }
   const { data, error } = await supabase
     .from('products')
     .update(patch)
@@ -193,12 +249,18 @@ async function updateProduct(adminId, identifier, input) {
     .single();
   fail(error, 'update product');
   await writeAudit(adminId, 'product.update', 'product', data.id || data.supplier_product_id, patch);
-  return data;
+  if (!settings) settings = await getSettings();
+  return pricingService.enrichProductPricing(data, settings.default_markup_percent);
 }
 
 async function archiveProduct(adminId, identifier) {
   const { product, column } = await findProduct(identifier);
-  const patch = { available: false, archived: true, updated_at: new Date().toISOString() };
+  const patch = {
+    available: false,
+    is_listed: false,
+    archived: true,
+    updated_at: new Date().toISOString(),
+  };
   const { data, error } = await supabase
     .from('products')
     .update(patch)
@@ -208,6 +270,52 @@ async function archiveProduct(adminId, identifier) {
   fail(error, 'archive product');
   await writeAudit(adminId, 'product.archive', 'product', data.id || data.supplier_product_id, patch);
   return data;
+}
+
+async function setProductListing(adminId, identifiers, isListed) {
+  const updated = [];
+  for (const identifier of identifiers) {
+    updated.push(await updateProduct(adminId, identifier, { is_listed: isListed }));
+  }
+  return {
+    updated: updated.length,
+    is_listed: isListed,
+    message: isListed
+      ? `${updated.length} product(s) added to your store.`
+      : `${updated.length} product(s) hidden from your store.`,
+  };
+}
+
+async function setProductPricing(adminId, identifiers, input) {
+  const products = [];
+  for (const identifier of identifiers) {
+    products.push((await findProduct(identifier)).product);
+  }
+  if (
+    input.pricing_mode !== pricingService.PRICING_MODES.FIXED
+    && products.some((product) => product.product_type === 'manual')
+  ) {
+    const error = new Error('Manual products cannot use supplier markup pricing. Remove them from the selection.');
+    error.status = 400;
+    error.code = 'MANUAL_PRODUCT_IN_BULK_PRICING';
+    throw error;
+  }
+  const updated = [];
+  for (const identifier of identifiers) {
+    updated.push(await updateProduct(adminId, identifier, {
+      pricing_mode: input.pricing_mode,
+      custom_markup_percent: input.custom_markup_percent,
+    }));
+  }
+  const modeLabel = input.pricing_mode === pricingService.PRICING_MODES.GLOBAL
+    ? 'global markup'
+    : `${Number(input.custom_markup_percent)}% custom markup`;
+  return {
+    updated: updated.length,
+    pricing_mode: input.pricing_mode,
+    custom_markup_percent: input.custom_markup_percent ?? null,
+    message: `${updated.length} product(s) now use ${modeLabel}.`,
+  };
 }
 
 async function ensureCategories() {
@@ -245,21 +353,24 @@ async function listCategories({ publicOnly = false } = {}) {
   if (publicOnly) query = query.eq('visible', true);
   const [categoriesResult, productsResult] = await Promise.all([
     query,
-    supabase.from('products').select('category_name,archived'),
+    supabase.from('products').select('category_name,is_listed,archived'),
   ]);
   fail(categoriesResult.error, 'list categories');
   fail(productsResult.error, 'count category products');
   const counts = new Map();
   for (const product of productsResult.data || []) {
-    if (product.archived) continue;
+    if (product.archived || !product.is_listed) continue;
     const key = cleanSearch(product.category_name);
     counts.set(key, (counts.get(key) || 0) + 1);
   }
-  return (categoriesResult.data || []).map((category) => ({
+  const categoriesWithCounts = (categoriesResult.data || []).map((category) => ({
     ...category,
     label: category.name,
     product_count: counts.get(cleanSearch(category.name)) || 0,
   }));
+  return publicOnly
+    ? categoriesWithCounts.filter((category) => category.product_count > 0)
+    : categoriesWithCounts;
 }
 
 async function updateCategory(adminId, identifier, input) {
@@ -421,6 +532,7 @@ async function getPublicSettings() {
     maintenance_mode: Boolean(settings.maintenance_mode),
     allow_orders: Boolean(settings.allow_orders),
     support_phone: settings.support_phone || '',
+    whish_phone: settings.whish_phone || '+96179306701',
   };
 }
 
@@ -430,6 +542,14 @@ async function updateSettings(adminId, input) {
   if (patch.default_markup_percent !== undefined) {
     patch.default_markup_percent = Number(patch.default_markup_percent);
   }
+  let repricedProducts = 0;
+  if (patch.default_markup_percent !== undefined) {
+    const repriceResult = await supabase.rpc('reprice_global_products', {
+      p_markup: patch.default_markup_percent,
+    });
+    fail(repriceResult.error, 'reprice products using global markup');
+    repricedProducts = Number(repriceResult.data || 0);
+  }
   const { data, error } = await supabase
     .from('app_settings')
     .update(patch)
@@ -438,13 +558,13 @@ async function updateSettings(adminId, input) {
     .single();
   fail(error, 'update settings');
   await writeAudit(adminId, 'settings.update', 'settings', SETTINGS_ID, patch);
-  return data;
+  return { ...data, repriced_products: repricedProducts };
 }
 
 async function getSupplierStatus() {
   const [settings, products] = await Promise.all([
     getSettings(),
-    supabase.from('products').select('supplier_product_id,archived'),
+    supabase.from('products').select('supplier_product_id,is_listed,archived'),
   ]);
   fail(products.error, 'load supplier product counts');
   const supplierProducts = (products.data || []).filter((product) => product.supplier_product_id != null);
@@ -455,8 +575,8 @@ async function getSupplierStatus() {
       message: 'Supplier API connected securely',
       last_sync_at: settings.last_supplier_sync_at,
       supplier_products: supplierProducts.length,
-      mapped_products: supplierProducts.filter((product) => !product.archived).length,
-      unmapped_products: supplierProducts.filter((product) => product.archived).length,
+      mapped_products: supplierProducts.filter((product) => product.is_listed && !product.archived).length,
+      unmapped_products: supplierProducts.filter((product) => !product.is_listed || product.archived).length,
       profile,
     };
   } catch (error) {
@@ -509,6 +629,8 @@ module.exports = {
   createProduct,
   updateProduct,
   archiveProduct,
+  setProductListing,
+  setProductPricing,
   listCategories,
   updateCategory,
   listOrders,

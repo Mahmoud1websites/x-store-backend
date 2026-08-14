@@ -28,6 +28,16 @@ async function refundHook(userId, amount, reason) {
   return store.creditWallet(userId, amount, reason);
 }
 
+const refundReason = (orderUuid) => `order:${orderUuid}:refund`;
+
+async function refundOrder(order) {
+  if (order.refunded_at) return order;
+  await refundHook(order.user_id, order.your_price, refundReason(order.order_uuid));
+  return store.updateOrder(order.order_uuid, {
+    refunded_at: new Date().toISOString(),
+  });
+}
+
 /**
  * Places a new order for a user.
  *
@@ -37,34 +47,69 @@ async function refundHook(userId, amount, reason) {
  * @param {number} args.qty
  * @param {Object} [args.extraParams] - e.g. { playerId: '12345' }
  */
-async function placeOrder({ userId, productId, qty, extraParams = {} }) {
+async function placeOrder({
+  userId,
+  productId,
+  qty,
+  extraParams = {},
+  clientRequestId = crypto.randomUUID(),
+}) {
+  const normalizedRequestId = String(clientRequestId).trim();
+  if (!normalizedRequestId || normalizedRequestId.length > 120) {
+    throw Object.assign(new Error('Invalid checkout request identifier'), {
+      code: 'INVALID_CHECKOUT_REQUEST',
+    });
+  }
+
+  const existingOrder = await store.getOrderByClientRequest(userId, normalizedRequestId);
+  if (existingOrder) return existingOrder;
+
   const product = await catalogService.getProductOrThrow(productId);
+  catalogService.validateProductForSale(product);
   catalogService.validateQty(product, qty);
+  const validatedParams = catalogService.validateExtraParams(product, extraParams);
 
   const orderUuid = crypto.randomUUID();
   const yourPrice = Number(product.your_price) * Number(qty);
+  if (!Number.isFinite(yourPrice) || yourPrice <= 0) {
+    throw Object.assign(new Error('Product price is invalid'), { code: 'INVALID_PRODUCT_PRICE' });
+  }
 
-  // Debit wallet BEFORE calling supplier so we never fulfill an order
-  // the user hasn't paid for. If this throws (insufficient balance),
-  // we stop here and never call the supplier.
-  await debitHook(userId, yourPrice, `order:${orderUuid}`);
-
-  // Persist locally first — this row is our source of truth even if
-  // the network call to the supplier below fails or times out.
+  // Create the idempotent order record before charging the wallet. A
+  // database unique index allows only one order per client request.
+  let order;
   try {
-    await store.createOrder({
+    order = await store.createOrder({
       order_uuid: orderUuid,
+      client_request_id: normalizedRequestId,
       user_id: userId,
       product_id: productId,
       qty,
-      extra_params: extraParams,
+      extra_params: validatedParams,
       your_price: yourPrice,
       supplier_price: Number(product.supplier_price) * Number(qty),
-      status: 'pending_supplier',
+      status: 'payment_pending',
       supplier_order_id: null,
     });
   } catch (error) {
-    await refundHook(userId, yourPrice, `order:${orderUuid}:persistence_refund`);
+    if (error.code === '23505') {
+      const duplicate = await store.getOrderByClientRequest(userId, normalizedRequestId);
+      if (duplicate) return duplicate;
+    }
+    throw error;
+  }
+
+  try {
+    await debitHook(userId, yourPrice, `order:${orderUuid}`);
+    order = await store.updateOrder(orderUuid, {
+      status: 'pending_supplier',
+      wallet_debited_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    await store.updateOrder(orderUuid, {
+      status: 'payment_failed',
+      error_message: error.message,
+    });
     throw error;
   }
 
@@ -74,7 +119,7 @@ async function placeOrder({ userId, productId, qty, extraParams = {} }) {
       productId,
       qty,
       orderUuid,
-      extraParams,
+      extraParams: validatedParams,
     });
   } catch (err) {
     // Network/unexpected failure talking to supplier: leave the order
@@ -82,19 +127,27 @@ async function placeOrder({ userId, productId, qty, extraParams = {} }) {
     // calls with the same orderUuid via supplierApi.newOrder directly,
     // since the supplier de-dupes on order_uuid. A retry job should
     // pick these up (see jobs/orderStatusPoller.js).
-    await store.updateOrder(orderUuid, { status: 'supplier_call_failed', error: err.message });
-    throw err;
+    return store.updateOrder(orderUuid, {
+      status: 'supplier_call_failed',
+      error_message: err.message,
+    });
   }
 
   const supplierStatus = result.data.status; // accept | reject | wait
-  const updated = await store.updateOrder(orderUuid, {
+  if (!['accept', 'reject', 'wait'].includes(supplierStatus)) {
+    return store.updateOrder(orderUuid, {
+      status: 'supplier_call_failed',
+      error_message: 'Supplier returned an unknown order status',
+    });
+  }
+  let updated = await store.updateOrder(orderUuid, {
     status: supplierStatus,
     supplier_order_id: result.data.order_id,
     supplier_response: result.data,
   });
 
   if (supplierStatus === 'reject') {
-    await refundHook(userId, yourPrice, `order:${orderUuid}:rejected`);
+    updated = await refundOrder(updated);
   }
 
   return updated;
@@ -104,13 +157,19 @@ async function placeOrder({ userId, productId, qty, extraParams = {} }) {
  * Re-checks a single order against the supplier and updates local status.
  * Used by both a manual "check my order" endpoint and the background poller.
  */
-async function recheckOrder(orderUuid) {
-  const order = await store.getOrderByUuid(orderUuid);
+async function recheckOrder(orderUuid, userId = null) {
+  let order = await store.getOrderByUuid(orderUuid);
   if (!order) {
     const err = new Error(`Order ${orderUuid} not found locally`);
     err.code = 'ORDER_NOT_FOUND';
     throw err;
   }
+  if (userId && String(order.user_id) !== String(userId)) {
+    const err = new Error('Order not found');
+    err.code = 'ORDER_NOT_FOUND';
+    throw err;
+  }
+  if (['accept', 'reject', 'payment_failed'].includes(order.status)) return order;
 
   // Prefer checking by our own UUID if we never got a supplier order_id
   // back (e.g. previous call failed before we recorded it).
@@ -120,15 +179,16 @@ async function recheckOrder(orderUuid) {
   const result = await supplierApi.checkOrders([idToCheck], useUuid);
   const supplierOrder = result.data[0];
   if (!supplierOrder) return order; // nothing to update yet
+  if (!['accept', 'reject', 'wait'].includes(supplierOrder.status)) return order;
 
-  const wasWait = order.status === 'wait';
-  const updated = await store.updateOrder(orderUuid, {
+  let updated = await store.updateOrder(orderUuid, {
     status: supplierOrder.status,
     supplier_order_id: supplierOrder.order_id,
+    error_message: null,
   });
 
-  if (wasWait && supplierOrder.status === 'reject') {
-    await refundHook(order.user_id, order.your_price, `order:${orderUuid}:rejected_on_recheck`);
+  if (supplierOrder.status === 'reject') {
+    updated = await refundOrder(updated);
   }
 
   return updated;

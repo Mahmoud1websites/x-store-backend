@@ -8,15 +8,11 @@
 
 const supplierApi = require('./supplierApi');
 const store = require('../db/db');
+const pricingService = require('./pricingService');
 
 // Set your markup strategy here. Simple flat % for now — swap for
 // per-category rules later if needed.
 const FALLBACK_MARGIN_PERCENT = Number(process.env.MARGIN_PERCENT || 10);
-
-function applyMargin(supplierPrice, marginPercent = FALLBACK_MARGIN_PERCENT) {
-  const price = Number(supplierPrice) * (1 + Number(marginPercent) / 100);
-  return Math.round(price * 1000) / 1000; // keep 3 decimals like supplier does
-}
 
 /**
  * Pulls the full catalog from the supplier and upserts it locally.
@@ -32,15 +28,19 @@ async function syncCatalog() {
   const withMargin = supplierProducts.map((p) => ({
     ...p,
     supplier_price: Number(p.price),
-    your_price: applyMargin(p.price, marginPercent),
+    your_price: pricingService.calculateCustomerPrice({
+      supplierPrice: p.price,
+      pricingMode: pricingService.PRICING_MODES.GLOBAL,
+      globalMarkupPercent: marginPercent,
+    }),
   }));
   const count = await store.upsertProducts(withMargin);
-  return { synced: count };
+  return { synced: count, global_markup_percent: marginPercent };
 }
 
 async function listAvailableProducts() {
   const all = await store.listProducts();
-  return all.filter((p) => p.available);
+  return all.filter((p) => p.available && p.is_listed && !p.archived);
 }
 
 async function getProductOrThrow(productId) {
@@ -51,6 +51,32 @@ async function getProductOrThrow(productId) {
     throw err;
   }
   return product;
+}
+
+function validateProductForSale(product) {
+  if (!product.available || !product.is_listed || product.archived) {
+    throw Object.assign(
+      new Error('This product is not currently available for purchase'),
+      { code: 'PRODUCT_UNAVAILABLE' }
+    );
+  }
+}
+
+function validateExtraParams(product, extraParams) {
+  const required = Array.isArray(product.params) ? product.params : [];
+  const supplied = extraParams && typeof extraParams === 'object' ? extraParams : {};
+  for (const field of required) {
+    const value = String(supplied[field] ?? '').trim();
+    if (!value) {
+      throw Object.assign(new Error(`${field} is required`), { code: 'MISSING_PRODUCT_PARAMETER' });
+    }
+    if (value.length > 300) {
+      throw Object.assign(new Error(`${field} is too long`), { code: 'INVALID_PRODUCT_PARAMETER' });
+    }
+  }
+  return Object.fromEntries(
+    required.map((field) => [field, String(supplied[field]).trim()])
+  );
 }
 
 /**
@@ -99,5 +125,7 @@ module.exports = {
   syncCatalog,
   listAvailableProducts,
   getProductOrThrow,
+  validateProductForSale,
+  validateExtraParams,
   validateQty,
 };

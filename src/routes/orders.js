@@ -3,6 +3,14 @@ const router = express.Router();
 const orderService = require('../services/orderService');
 const requireAuth = require('../middleware/requireAuth');
 const adminService = require('../services/adminService');
+const { z } = require('zod');
+
+const createOrderSchema = z.object({
+  productId: z.union([z.string().trim().min(1), z.number()]),
+  qty: z.coerce.number().positive(),
+  extraParams: z.record(z.string(), z.union([z.string(), z.number()])).optional().default({}),
+  clientRequestId: z.string().trim().min(8).max(120).optional(),
+});
 
 // All order routes require a logged-in user.
 router.use(requireAuth);
@@ -26,9 +34,13 @@ router.get('/', async (req, res) => {
  * order "as" another user by editing the request.
  */
 router.post('/', async (req, res) => {
-  const { productId, qty, extraParams } = req.body;
-  if (!productId || !qty) {
-    return res.status(400).json({ status: 'ERROR', message: 'productId and qty are required' });
+  const parsed = createOrderSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      status: 'ERROR',
+      code: 'VALIDATION_ERROR',
+      message: parsed.error.issues.map((issue) => issue.message).join(', '),
+    });
   }
   try {
     const settings = await adminService.getPublicSettings();
@@ -39,7 +51,10 @@ router.post('/', async (req, res) => {
         message: 'New orders are temporarily paused',
       });
     }
-    const order = await orderService.placeOrder({ userId: req.user.id, productId, qty, extraParams });
+    const order = await orderService.placeOrder({
+      userId: req.user.id,
+      ...parsed.data,
+    });
     res.json({ status: 'OK', data: order });
   } catch (err) {
     const statusCode = err.code ? 400 : 502;
@@ -50,11 +65,7 @@ router.post('/', async (req, res) => {
 // GET /api/orders/:orderUuid - recheck & return current status
 router.get('/:orderUuid', async (req, res) => {
   try {
-    const order = await orderService.recheckOrder(req.params.orderUuid);
-    // Make sure users can only check their own orders.
-    if (order.user_id !== req.user.id) {
-      return res.status(404).json({ status: 'ERROR', code: 'ORDER_NOT_FOUND', message: 'Order not found' });
-    }
+    const order = await orderService.recheckOrder(req.params.orderUuid, req.user.id);
     res.json({ status: 'OK', data: order });
   } catch (err) {
     const statusCode = err.code === 'ORDER_NOT_FOUND' ? 404 : 502;

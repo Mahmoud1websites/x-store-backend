@@ -15,7 +15,11 @@ const orderService = require('../services/orderService');
 let intervalHandle = null;
 
 async function pollOnce() {
-  const waitingOrders = await store.listOrdersByStatus('wait');
+  const waitingOrders = await store.listOrdersByStatuses([
+    'wait',
+    'pending_supplier',
+    'supplier_call_failed',
+  ]);
   if (waitingOrders.length === 0) return;
 
   console.log(`[orderStatusPoller] rechecking ${waitingOrders.length} waiting order(s)`);

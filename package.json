@@ -2,11 +2,14 @@
   "name": "x-store-backend",
   "version": "2.0.0",
   "private": true,
+  "description": "Secure API for the X Store mobile app and administration dashboard",
   "main": "src/app.js",
   "scripts": {
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
-    "check": "node src/scripts/check-syntax.js"
+    "check": "node src/scripts/check-syntax.js",
+    "test:wallet": "node src/scripts/check-wallet-order-flow.js",
+    "test:pricing": "node src/scripts/check-pricing-flow.js"
   },
   "engines": {
     "node": ">=18"

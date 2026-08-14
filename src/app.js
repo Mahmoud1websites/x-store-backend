@@ -9,6 +9,7 @@ const ordersRouter = require('./routes/orders');
 const adminRouter = require('./routes/admin');
 const categoriesRouter = require('./routes/categories');
 const settingsRouter = require('./routes/settings');
+const walletRouter = require('./routes/wallet');
 const requireAuth = require('./middleware/requireAuth');
 const requireAdmin = require('./middleware/requireAdmin');
 const { startOrderStatusPoller } = require('./jobs/orderStatusPoller');
@@ -54,6 +55,7 @@ app.use('/api/products', productsRouter);
 app.use('/api/orders', ordersRouter);
 app.use('/api/categories', categoriesRouter);
 app.use('/api/settings', settingsRouter);
+app.use('/api/wallet', walletRouter);
 app.use('/api/admin', adminRouter);
 
 app.use((req, res) => {

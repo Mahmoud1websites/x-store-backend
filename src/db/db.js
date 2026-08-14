@@ -12,10 +12,14 @@
  */
 
 const supabase = require('./supabaseClient');
+const pricingService = require('../services/pricingService');
 
 function throwIfError(error, context) {
   if (error) {
-    throw new Error(`[db] ${context}: ${error.message}`);
+    const wrapped = new Error(`[db] ${context}: ${error.message}`);
+    wrapped.code = error.code;
+    wrapped.details = error.details;
+    throw wrapped;
   }
 }
 
@@ -90,29 +94,50 @@ async function upsertProducts(productList) {
   const supplierIds = productList.map((p) => p.id);
   const { data: existingRows, error: existingError } = await supabase
     .from('products')
-    .select('supplier_product_id,your_price,image_url,price_overridden,image_overridden,archived')
+    .select('supplier_product_id,your_price,image_url,price_overridden,image_overridden,is_listed,archived,pricing_mode,custom_markup_percent')
     .in('supplier_product_id', supplierIds);
   throwIfError(existingError, 'load products before sync');
   const existingBySupplierId = new Map(
     (existingRows || []).map((row) => [String(row.supplier_product_id), row])
   );
 
-  const rows = productList.map((p) => ({
-    ...(existingBySupplierId.get(String(p.id)) || {}),
-    supplier_product_id: p.id,
-    name: p.name,
-    category_name: p.category_name,
-    category_img: p.category_img || null,
-    supplier_price: p.supplier_price,
-    your_price: existingBySupplierId.get(String(p.id))?.price_overridden
-      ? existingBySupplierId.get(String(p.id)).your_price
-      : p.your_price,
-    product_type: p.product_type,
-    qty_values: p.qty_values,
-    params: p.params,
-    available: existingBySupplierId.get(String(p.id))?.archived ? false : p.available,
-    updated_at: new Date().toISOString(),
-  }));
+  const now = new Date().toISOString();
+  const rows = productList.map((p) => {
+    const existing = existingBySupplierId.get(String(p.id)) || {};
+    const pricingMode = pricingService.normalizePricingMode(existing);
+    let customerPrice = p.your_price;
+    if (pricingMode === pricingService.PRICING_MODES.FIXED) {
+      customerPrice = existing.your_price;
+    } else if (pricingMode === pricingService.PRICING_MODES.PERCENTAGE) {
+      customerPrice = pricingService.calculateCustomerPrice({
+        supplierPrice: p.supplier_price,
+        pricingMode,
+        customMarkupPercent: existing.custom_markup_percent,
+      });
+    }
+
+    return {
+      ...existing,
+      supplier_product_id: p.id,
+      name: p.name,
+      category_name: p.category_name,
+      category_img: p.category_img || null,
+      supplier_price: p.supplier_price,
+      supplier_price_updated_at: now,
+      your_price: customerPrice,
+      pricing_mode: pricingMode,
+      custom_markup_percent: pricingMode === pricingService.PRICING_MODES.PERCENTAGE
+        ? existing.custom_markup_percent
+        : null,
+      price_overridden: pricingMode !== pricingService.PRICING_MODES.GLOBAL,
+      product_type: p.product_type,
+      qty_values: p.qty_values,
+      params: p.params,
+      is_listed: existing.is_listed ?? false,
+      available: existing.archived ? false : p.available,
+      updated_at: now,
+    };
+  });
   const { data, error } = await supabase
     .from('products')
     .upsert(rows, { onConflict: 'supplier_product_id' })
@@ -144,6 +169,7 @@ async function createOrder(order) {
     .from('orders')
     .insert({
       order_uuid: order.order_uuid,
+      client_request_id: order.client_request_id,
       user_id: order.user_id,
       product_id: order.product_id,
       qty: order.qty,
@@ -156,6 +182,17 @@ async function createOrder(order) {
     .select()
     .single();
   throwIfError(error, 'createOrder');
+  return data;
+}
+
+async function getOrderByClientRequest(userId, clientRequestId) {
+  const { data, error } = await supabase
+    .from('orders')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('client_request_id', clientRequestId)
+    .maybeSingle();
+  throwIfError(error, 'getOrderByClientRequest');
   return data;
 }
 
@@ -182,6 +219,15 @@ async function listOrdersByStatus(status) {
   return data || [];
 }
 
+async function listOrdersByStatuses(statuses) {
+  const { data, error } = await supabase
+    .from('orders')
+    .select('*')
+    .in('status', statuses);
+  throwIfError(error, 'listOrdersByStatuses');
+  return data || [];
+}
+
 async function listOrdersByUser(userId) {
   const { data, error } = await supabase
     .from('orders')
@@ -197,9 +243,11 @@ module.exports = {
   getProduct,
   listProducts,
   createOrder,
+  getOrderByClientRequest,
   getOrderByUuid,
   updateOrder,
   listOrdersByStatus,
+  listOrdersByStatuses,
   listOrdersByUser,
   createUser,
   getUserByEmail,
