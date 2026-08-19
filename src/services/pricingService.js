@@ -6,6 +6,17 @@ const PRICING_MODES = Object.freeze({
 
 const VALID_MODES = new Set(Object.values(PRICING_MODES));
 
+const CUSTOMER_TYPES = Object.freeze({
+  RETAIL: 'retail',
+  RESELLER: 'reseller',
+});
+
+function normalizeCustomerType(value) {
+  return String(value || '').toLowerCase() === CUSTOMER_TYPES.RESELLER
+    ? CUSTOMER_TYPES.RESELLER
+    : CUSTOMER_TYPES.RETAIL;
+}
+
 function numberOr(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -80,6 +91,10 @@ function enrichProductPricing(product, globalMarkupPercent = 0) {
         ? ((customerPrice - supplierPrice) / supplierPrice) * 100
         : null;
   const profitAmount = roundPrice(customerPrice - supplierPrice);
+  const resellerPrice = product.reseller_price == null
+    ? customerPrice
+    : numberOr(product.reseller_price, customerPrice);
+  const resellerProfit = roundPrice(resellerPrice - supplierPrice);
 
   return {
     ...product,
@@ -96,15 +111,38 @@ function enrichProductPricing(product, globalMarkupPercent = 0) {
       ? roundPrice((profitAmount / supplierPrice) * 100)
       : null,
     below_cost: supplierPrice > 0 && customerPrice < supplierPrice,
+    reseller_price: resellerPrice,
+    reseller_profit_amount: resellerProfit,
+    reseller_profit_percent: supplierPrice > 0
+      ? roundPrice((resellerProfit / supplierPrice) * 100)
+      : null,
+    reseller_below_cost: supplierPrice > 0 && resellerPrice < supplierPrice,
+  };
+}
+
+function priceForCustomer(product, customerType) {
+  const type = normalizeCustomerType(customerType);
+  const retailPrice = numberOr(product.your_price);
+  const resellerPrice = product.reseller_price == null
+    ? retailPrice
+    : numberOr(product.reseller_price, retailPrice);
+  return {
+    customer_type: type,
+    unit_price: roundPrice(
+      type === CUSTOMER_TYPES.RESELLER ? resellerPrice : retailPrice,
+    ),
   };
 }
 
 module.exports = {
   PRICING_MODES,
   VALID_MODES,
+  CUSTOMER_TYPES,
+  normalizeCustomerType,
   roundPrice,
   validateMarkup,
   normalizePricingMode,
   calculateCustomerPrice,
   enrichProductPricing,
+  priceForCustomer,
 };

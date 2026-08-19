@@ -5,6 +5,8 @@ const supabase = require('../db/supabaseClient');
 const catalogService = require('./catalogService');
 const supplierApi = require('./supplierApi');
 const pricingService = require('./pricingService');
+const authService = require('./authService');
+const operationsService = require('./operationsService');
 
 const SETTINGS_ID = 1;
 const IMAGE_BUCKET = process.env.SUPABASE_IMAGE_BUCKET || 'x-store-images';
@@ -46,7 +48,7 @@ async function getAdminMe(admin) {
 
 async function loadDashboardData() {
   const [usersResult, productsResult, ordersResult] = await Promise.all([
-    supabase.from('users').select('id,email,wallet_balance,role,disabled,created_at'),
+    supabase.from('users').select('id,email,phone_e164,display_name,auth_provider,wallet_balance,role,customer_type,disabled,created_at'),
     supabase.from('products').select('*'),
     supabase.from('orders').select('*').order('created_at', { ascending: false }),
   ]);
@@ -74,8 +76,9 @@ function enrichOrders(orders, users, products) {
     const product = productsById.get(String(order.product_id));
     return {
       ...order,
-      email: user?.email || null,
-      customer_email: user?.email || null,
+      email: user?.email || user?.phone_e164 || null,
+      customer_email: user?.email || user?.phone_e164 || null,
+      customer_type: order.customer_type || user?.customer_type || 'retail',
       product_name: product?.name || null,
     };
   });
@@ -96,6 +99,29 @@ async function getOverview() {
     .filter((order) => fulfilledStatuses.has(String(order.status).toLowerCase()))
     .reduce((sum, order) => sum + Number(order.supplier_price || 0), 0);
   const grossProfit = pricingService.roundPrice(revenue - supplierCost);
+  const daily = new Map();
+  for (let offset = 13; offset >= 0; offset -= 1) {
+    const day = new Date();
+    day.setUTCHours(0, 0, 0, 0);
+    day.setUTCDate(day.getUTCDate() - offset);
+    const key = day.toISOString().slice(0, 10);
+    daily.set(key, { date: key, revenue: 0, cost: 0, profit: 0, orders: 0 });
+  }
+  for (const order of orders) {
+    const point = daily.get(String(order.created_at || '').slice(0, 10));
+    if (!point) continue;
+    point.orders += 1;
+    if (fulfilledStatuses.has(String(order.status).toLowerCase())) {
+      point.revenue += Number(order.your_price || order.total || 0);
+      point.cost += Number(order.supplier_price || 0);
+      point.profit = pricingService.roundPrice(point.revenue - point.cost);
+    }
+  }
+  const orderStatuses = orders.reduce((counts, order) => {
+    const key = cleanSearch(order.status) || 'unknown';
+    counts[key] = (counts[key] || 0) + 1;
+    return counts;
+  }, {});
 
   let supplier;
   try {
@@ -117,7 +143,124 @@ async function getOverview() {
     products: products.filter((product) => product.is_listed && !product.archived).length,
     pendingWalletRequests: pendingWalletRequests || 0,
     recentOrders: enrichOrders(orders.slice(0, 8), users, products),
+    daily: Array.from(daily.values()),
+    orderStatuses,
     supplier,
+  };
+}
+
+function reportWindow(value) {
+  const days = Math.min(Math.max(Number(value) || 30, 1), 365);
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  since.setUTCHours(0, 0, 0, 0);
+  return { days, since: since.toISOString() };
+}
+
+async function getReports(rangeDays = 30) {
+  const { days, since } = reportWindow(rangeDays);
+  const [ordersResult, ledgerResult, productsResult, syncResult] = await Promise.all([
+    supabase.from('orders').select('*').gte('created_at', since).order('created_at'),
+    supabase.from('wallet_ledger').select('*').gte('created_at', since).order('created_at'),
+    supabase.from('products').select('id,supplier_product_id,name,category_name,supplier_price,your_price'),
+    supabase.from('supplier_sync_logs').select('*').gte('started_at', since).order('started_at', { ascending: false }),
+  ]);
+  fail(ordersResult.error, 'load report orders');
+  fail(ledgerResult.error, 'load wallet report');
+  fail(productsResult.error, 'load report products');
+  fail(syncResult.error, 'load supplier report');
+
+  const orders = ordersResult.data || [];
+  const ledger = ledgerResult.data || [];
+  const products = productsResult.data || [];
+  const syncs = syncResult.data || [];
+  const completed = orders.filter((order) => ['accept', 'completed'].includes(cleanSearch(order.status)));
+  const revenue = completed.reduce((sum, order) => sum + Number(order.your_price || 0), 0);
+  const supplierCost = completed.reduce((sum, order) => sum + Number(order.supplier_price || 0), 0);
+  const grossProfit = pricingService.roundPrice(revenue - supplierCost);
+  const walletCredits = ledger.filter((row) => Number(row.amount) > 0)
+    .reduce((sum, row) => sum + Number(row.amount), 0);
+  const walletDebits = Math.abs(ledger.filter((row) => Number(row.amount) < 0)
+    .reduce((sum, row) => sum + Number(row.amount), 0));
+
+  const productsById = new Map();
+  for (const product of products) {
+    if (product.id != null) productsById.set(String(product.id), product);
+    if (product.supplier_product_id != null) productsById.set(String(product.supplier_product_id), product);
+  }
+  const topProductMap = new Map();
+  for (const order of completed) {
+    const product = productsById.get(String(order.product_id));
+    const key = String(order.product_id);
+    const current = topProductMap.get(key) || {
+      product_id: order.product_id,
+      name: product?.name || `Product ${order.product_id}`,
+      category: product?.category_name || 'Other',
+      orders: 0,
+      revenue: 0,
+      supplier_cost: 0,
+      profit: 0,
+    };
+    current.orders += 1;
+    current.revenue += Number(order.your_price || 0);
+    current.supplier_cost += Number(order.supplier_price || 0);
+    current.profit = pricingService.roundPrice(current.revenue - current.supplier_cost);
+    topProductMap.set(key, current);
+  }
+
+  const dailyMap = new Map();
+  for (let offset = days - 1; offset >= 0; offset -= 1) {
+    const day = new Date();
+    day.setUTCHours(0, 0, 0, 0);
+    day.setUTCDate(day.getUTCDate() - offset);
+    const key = day.toISOString().slice(0, 10);
+    dailyMap.set(key, { date: key, revenue: 0, cost: 0, profit: 0, orders: 0 });
+  }
+  for (const order of orders) {
+    const key = String(order.created_at || '').slice(0, 10);
+    const day = dailyMap.get(key);
+    if (!day) continue;
+    day.orders += 1;
+    if (['accept', 'completed'].includes(cleanSearch(order.status))) {
+      day.revenue += Number(order.your_price || 0);
+      day.cost += Number(order.supplier_price || 0);
+      day.profit = pricingService.roundPrice(day.revenue - day.cost);
+    }
+  }
+
+  const statusCounts = orders.reduce((counts, order) => {
+    const key = cleanSearch(order.status) || 'unknown';
+    counts[key] = (counts[key] || 0) + 1;
+    return counts;
+  }, {});
+  const successfulSyncs = syncs.filter((item) => item.status === 'success').length;
+  const latestSync = syncs[0] || null;
+
+  return {
+    range_days: days,
+    since,
+    revenue: pricingService.roundPrice(revenue),
+    supplier_cost: pricingService.roundPrice(supplierCost),
+    gross_profit: grossProfit,
+    gross_margin_percent: revenue > 0 ? pricingService.roundPrice((grossProfit / revenue) * 100) : 0,
+    orders: orders.length,
+    completed_orders: completed.length,
+    average_order_value: completed.length ? pricingService.roundPrice(revenue / completed.length) : 0,
+    wallet_credits: pricingService.roundPrice(walletCredits),
+    wallet_debits: pricingService.roundPrice(walletDebits),
+    order_statuses: statusCounts,
+    daily: Array.from(dailyMap.values()),
+    top_products: Array.from(topProductMap.values())
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 10),
+    supplier_performance: {
+      synchronizations: syncs.length,
+      successful: successfulSyncs,
+      failed: syncs.filter((item) => item.status === 'failed').length,
+      success_rate: syncs.length ? pricingService.roundPrice((successfulSyncs / syncs.length) * 100) : 0,
+      last_status: latestSync?.status || null,
+      last_sync_at: latestSync?.completed_at || latestSync?.started_at || null,
+      last_error: latestSync?.status === 'failed' ? latestSync.error_message || null : null,
+    },
   };
 }
 
@@ -160,13 +303,23 @@ async function findProduct(identifier) {
 
 function productPatch(input) {
   const patch = {};
-  const fields = ['name', 'category_name', 'available', 'is_listed', 'supplier_product_id'];
+  const fields = [
+    'name',
+    'category_name',
+    'available',
+    'is_listed',
+    'supplier_product_id',
+    'supplier_category_id',
+  ];
   for (const field of fields) {
     if (input[field] !== undefined) patch[field] = input[field];
   }
   if (input.image_url !== undefined) {
     patch.image_url = input.image_url || null;
     patch.image_overridden = true;
+  }
+  if (input.reseller_price !== undefined) {
+    patch.reseller_price = Number(input.reseller_price);
   }
   patch.updated_at = new Date().toISOString();
   return patch;
@@ -178,8 +331,10 @@ async function createProduct(adminId, input) {
     supplier_product_id: supplierProductId,
     name: input.name,
     category_name: input.category_name || 'Other',
+    supplier_category_id: input.supplier_category_id ?? null,
     supplier_price: 0,
     your_price: Number(input.your_price),
+    reseller_price: Number(input.reseller_price ?? input.your_price),
     product_type: 'manual',
     qty_values: null,
     params: {},
@@ -321,26 +476,94 @@ async function setProductPricing(adminId, identifiers, input) {
 async function ensureCategories() {
   const [categoriesResult, productsResult] = await Promise.all([
     supabase.from('categories').select('*'),
-    supabase.from('products').select('category_name,category_img,image_url'),
+    supabase
+      .from('products')
+      .select('category_name,category_img,image_url,supplier_category_id'),
   ]);
   fail(categoriesResult.error, 'load categories');
   fail(productsResult.error, 'load product categories');
 
   const categories = categoriesResult.data || [];
-  const knownNames = new Set(categories.map((category) => cleanSearch(category.name)));
+  const knownSupplierIds = new Set(
+    categories
+      .map((category) => Number(category.supplier_category_id))
+      .filter((value) => Number.isFinite(value) && value > 0),
+  );
+  const categoriesByName = new Map(
+    categories.map((category) => [cleanSearch(category.supplier_name || category.name), category]),
+  );
+  const claimedNames = new Set();
+  const queuedFallbackNames = new Set();
   const missing = [];
+  const backfills = [];
+  const syncedAt = new Date().toISOString();
+
   for (const product of productsResult.data || []) {
     const name = String(product.category_name || '').trim();
-    if (!name || knownNames.has(cleanSearch(name))) continue;
-    knownNames.add(cleanSearch(name));
+    if (!name || cleanSearch(name) === 'null') continue;
+
+    const rawSupplierId = Number(product.supplier_category_id);
+    const supplierCategoryId = Number.isFinite(rawSupplierId) && rawSupplierId > 0
+      ? rawSupplierId
+      : null;
+    const normalizedName = cleanSearch(name);
+    const imageCandidate = String(product.category_img || product.image_url || '').trim();
+    const imageUrl = imageCandidate
+      && !imageCandidate.endsWith('/empty.png')
+      && imageCandidate !== 'https://api.kamal-cell.com/'
+      ? imageCandidate
+      : null;
+
+    if (supplierCategoryId && knownSupplierIds.has(supplierCategoryId)) continue;
+
+    const sameName = categoriesByName.get(normalizedName);
+    if (
+      supplierCategoryId
+      && sameName
+      && sameName.supplier_category_id == null
+      && !claimedNames.has(normalizedName)
+    ) {
+      claimedNames.add(normalizedName);
+      knownSupplierIds.add(supplierCategoryId);
+      backfills.push({
+        id: sameName.id,
+        supplier_category_id: supplierCategoryId,
+        supplier_name: name,
+        source: 'supplier',
+        synced_at: syncedAt,
+        image_url: sameName.image_url || imageUrl,
+      });
+      continue;
+    }
+
+    if (
+      !supplierCategoryId
+      && (categoriesByName.has(normalizedName) || queuedFallbackNames.has(normalizedName))
+    ) continue;
+    if (supplierCategoryId) knownSupplierIds.add(supplierCategoryId);
+    else queuedFallbackNames.add(normalizedName);
+
     missing.push({
-      key: `${slugify(name)}-${crypto.randomBytes(3).toString('hex')}`,
+      key: supplierCategoryId
+        ? `supplier-${supplierCategoryId}`
+        : `${slugify(name)}-${crypto.randomBytes(3).toString('hex')}`,
       name,
-      image_url: product.category_img || product.image_url || null,
+      supplier_name: supplierCategoryId ? name : null,
+      supplier_category_id: supplierCategoryId,
+      source: supplierCategoryId ? 'supplier' : 'manual',
+      synced_at: supplierCategoryId ? syncedAt : null,
+      image_url: imageUrl,
       description: '',
       visible: true,
     });
   }
+
+  for (const row of backfills) {
+    const { id, ...patch } = row;
+    const { error } = await supabase.from('categories').update(patch).eq('id', id);
+    fail(error, 'connect discovered category to supplier ID');
+  }
+
   if (missing.length) {
     const { error } = await supabase.from('categories').insert(missing);
     fail(error, 'create discovered categories');
@@ -353,21 +576,42 @@ async function listCategories({ publicOnly = false } = {}) {
   if (publicOnly) query = query.eq('visible', true);
   const [categoriesResult, productsResult] = await Promise.all([
     query,
-    supabase.from('products').select('category_name,is_listed,archived'),
+    supabase
+      .from('products')
+      .select('category_name,supplier_category_id,is_listed,available,archived'),
   ]);
   fail(categoriesResult.error, 'list categories');
   fail(productsResult.error, 'count category products');
-  const counts = new Map();
+  const totalCounts = new Map();
+  const listedCounts = new Map();
+  const unavailableCounts = new Map();
   for (const product of productsResult.data || []) {
-    if (product.archived || !product.is_listed) continue;
-    const key = cleanSearch(product.category_name);
-    counts.set(key, (counts.get(key) || 0) + 1);
+    if (product.archived) continue;
+    const rawSupplierId = Number(product.supplier_category_id);
+    const key = Number.isFinite(rawSupplierId) && rawSupplierId > 0
+      ? `supplier:${rawSupplierId}`
+      : `name:${cleanSearch(product.category_name)}`;
+    totalCounts.set(key, (totalCounts.get(key) || 0) + 1);
+    if (product.is_listed && product.available) {
+      listedCounts.set(key, (listedCounts.get(key) || 0) + 1);
+    }
+    if (!product.available) {
+      unavailableCounts.set(key, (unavailableCounts.get(key) || 0) + 1);
+    }
   }
-  const categoriesWithCounts = (categoriesResult.data || []).map((category) => ({
-    ...category,
-    label: category.name,
-    product_count: counts.get(cleanSearch(category.name)) || 0,
-  }));
+  const categoriesWithCounts = (categoriesResult.data || []).map((category) => {
+    const key = category.supplier_category_id != null
+      ? `supplier:${Number(category.supplier_category_id)}`
+      : `name:${cleanSearch(category.supplier_name || category.name)}`;
+    return {
+      ...category,
+      label: category.name,
+      product_count: listedCounts.get(key) || 0,
+      listed_product_count: listedCounts.get(key) || 0,
+      total_product_count: totalCounts.get(key) || 0,
+      unavailable_product_count: unavailableCounts.get(key) || 0,
+    };
+  });
   return publicOnly
     ? categoriesWithCounts.filter((category) => category.product_count > 0)
     : categoriesWithCounts;
@@ -390,7 +634,7 @@ async function updateCategory(adminId, identifier, input) {
   }
 
   const patch = { updated_at: new Date().toISOString() };
-  for (const field of ['name', 'description', 'image_url', 'visible']) {
+  for (const field of ['name', 'description', 'image_url', 'visible', 'sort_order']) {
     if (input[field] !== undefined) patch[field] = input[field];
   }
   const { data, error } = await supabase
@@ -401,7 +645,11 @@ async function updateCategory(adminId, identifier, input) {
     .single();
   fail(error, 'update category');
 
-  if (input.name && input.name !== current.name) {
+  if (
+    input.name
+    && input.name !== current.name
+    && current.supplier_category_id == null
+  ) {
     const { error: productError } = await supabase
       .from('products')
       .update({ category_name: input.name, updated_at: new Date().toISOString() })
@@ -463,7 +711,7 @@ async function listUsers(search) {
   const [usersResult, ordersResult] = await Promise.all([
     supabase
       .from('users')
-      .select('id,email,wallet_balance,role,disabled,created_at')
+      .select('id,email,phone_e164,display_name,auth_provider,wallet_balance,role,customer_type,disabled,email_verified,email_verified_at,phone_verified_at,created_at')
       .order('created_at', { ascending: false }),
     supabase.from('orders').select('user_id'),
   ]);
@@ -475,20 +723,51 @@ async function listUsers(search) {
     counts.set(key, (counts.get(key) || 0) + 1);
   }
   return (usersResult.data || [])
-    .filter((user) => !term || user.email.toLowerCase().includes(term))
+    .filter((user) => {
+      if (!term) return true;
+      const typeLabel = user.customer_type === 'reseller' ? 'supplier reseller' : 'user retail';
+      const identity = `${user.email || ''} ${user.phone_e164 || ''} ${user.display_name || ''}`.toLowerCase();
+      return identity.includes(term) || typeLabel.includes(term);
+    })
     .map((user) => ({ ...user, wallet_balance: Number(user.wallet_balance || 0), order_count: counts.get(String(user.id)) || 0 }));
 }
 
 async function updateUser(adminId, userId, input) {
-  const { data, error } = await supabase.rpc('admin_update_user', {
-    p_admin_id: adminId,
-    p_user_id: userId,
-    p_wallet_balance: input.wallet_balance === undefined ? null : Number(input.wallet_balance),
-    p_disabled: input.disabled === undefined ? null : Boolean(input.disabled),
-    p_reason: input.audit_reason,
-  });
-  fail(error, 'update user');
-  return Array.isArray(data) ? data[0] : data;
+  if (input.wallet_balance !== undefined || input.disabled !== undefined) {
+    const { error } = await supabase.rpc('admin_update_user', {
+      p_admin_id: adminId,
+      p_user_id: userId,
+      p_wallet_balance: input.wallet_balance === undefined ? null : Number(input.wallet_balance),
+      p_disabled: input.disabled === undefined ? null : Boolean(input.disabled),
+      p_reason: input.audit_reason,
+    });
+    fail(error, 'update user wallet or status');
+  }
+
+  if (input.customer_type !== undefined) {
+    const customerType = pricingService.normalizeCustomerType(input.customer_type);
+    const { error } = await supabase
+      .from('users')
+      .update({ customer_type: customerType, updated_at: new Date().toISOString() })
+      .eq('id', userId);
+    fail(error, 'update customer pricing type');
+    await writeAudit(
+      adminId,
+      'customer.type.update',
+      'user',
+      userId,
+      { customer_type: customerType },
+      input.audit_reason,
+    );
+  }
+
+  const { data, error } = await supabase
+    .from('users')
+    .select('id,email,phone_e164,display_name,auth_provider,wallet_balance,role,customer_type,disabled,email_verified,email_verified_at,phone_verified_at,created_at')
+    .eq('id', userId)
+    .single();
+  fail(error, 'reload updated user');
+  return data;
 }
 
 async function createAdmin(adminId, input) {
@@ -504,15 +783,111 @@ async function createAdmin(adminId, input) {
     error.status = 409;
     throw error;
   }
+  authService.validatePassword(input.password);
+  if (input.password.length < 12) {
+    const error = new Error('Administrator passwords must contain at least 12 characters');
+    error.status = 400;
+    error.code = 'WEAK_ADMIN_PASSWORD';
+    throw error;
+  }
   const passwordHash = await bcrypt.hash(input.password, 12);
   const { data, error } = await supabase
     .from('users')
-    .insert({ id: crypto.randomUUID(), email, password_hash: passwordHash, role: 'admin', disabled: false })
-    .select('id,email,wallet_balance,role,disabled,created_at')
+    .insert({
+      id: crypto.randomUUID(),
+      email,
+      password_hash: passwordHash,
+      role: 'admin',
+      disabled: false,
+      email_verified: true,
+      email_verified_at: new Date().toISOString(),
+    })
+    .select('id,email,wallet_balance,role,customer_type,disabled,email_verified,created_at')
     .single();
   fail(error, 'create administrator');
   await writeAudit(adminId, 'admin.create', 'user', data.id, { email: data.email, role: 'admin' });
   return data;
+}
+
+async function updateAdminAccount(adminId, input) {
+  const { data: current, error: currentError } = await supabase
+    .from('users')
+    .select('*')
+    .eq('id', adminId)
+    .single();
+  fail(currentError, 'load administrator account');
+
+  const passwordMatches = await bcrypt.compare(
+    input.current_password || '',
+    current.password_hash || '',
+  );
+  if (!passwordMatches) {
+    const error = new Error('Current password is incorrect');
+    error.status = 401;
+    error.code = 'INVALID_CURRENT_PASSWORD';
+    throw error;
+  }
+
+  const patch = { updated_at: new Date().toISOString() };
+  const changes = {};
+  if (input.email !== undefined) {
+    const email = input.email.trim().toLowerCase();
+    if (email !== current.email) {
+      const { data: existing, error: existingError } = await supabase
+        .from('users')
+        .select('id')
+        .ilike('email', email)
+        .neq('id', adminId)
+        .maybeSingle();
+      fail(existingError, 'check updated administrator email');
+      if (existing) {
+        const error = new Error('An account with this email already exists');
+        error.status = 409;
+        error.code = 'EMAIL_TAKEN';
+        throw error;
+      }
+      patch.email = email;
+      changes.email = { from: current.email, to: email };
+    }
+  }
+
+  if (input.password) {
+    authService.validatePassword(input.password);
+    if (input.password.length < 12) {
+      const error = new Error('Administrator passwords must contain at least 12 characters');
+      error.status = 400;
+      error.code = 'WEAK_ADMIN_PASSWORD';
+      throw error;
+    }
+    patch.password_hash = await bcrypt.hash(input.password, 12);
+    patch.password_changed_at = new Date().toISOString();
+    changes.password_changed = true;
+  }
+
+  if (Object.keys(changes).length === 0) {
+    const error = new Error('Enter a different email or a new password');
+    error.status = 400;
+    error.code = 'NOTHING_TO_UPDATE';
+    throw error;
+  }
+
+  const { data, error } = await supabase
+    .from('users')
+    .update(patch)
+    .eq('id', adminId)
+    .select('*')
+    .single();
+  fail(error, 'update administrator account');
+  await writeAudit(
+    adminId,
+    'admin.account.update',
+    'user',
+    adminId,
+    changes,
+    'Administrator updated own credentials',
+  );
+  const admin = authService.toPublicUser(data);
+  return { admin, token: authService.issueToken(data) };
 }
 
 async function getSettings() {
@@ -531,8 +906,8 @@ async function getPublicSettings() {
     exchange_rate: Number(settings.exchange_rate),
     maintenance_mode: Boolean(settings.maintenance_mode),
     allow_orders: Boolean(settings.allow_orders),
-    support_phone: settings.support_phone || '',
-    whish_phone: settings.whish_phone || '+96179306701',
+    support_phone: settings.support_phone || process.env.XSTORE_SUPPORT_PHONE || '+96176345701',
+    whish_phone: settings.whish_phone || process.env.XSTORE_WHISH_PHONE || '+96176345701',
   };
 }
 
@@ -590,20 +965,82 @@ async function getSupplierStatus() {
 }
 
 async function syncSupplier(adminId) {
-  const result = await catalogService.syncCatalog();
-  const now = new Date().toISOString();
-  const { error } = await supabase
-    .from('app_settings')
-    .update({ last_supplier_sync_at: now, updated_at: now })
-    .eq('id', SETTINGS_ID);
-  fail(error, 'record supplier synchronization');
-  await writeAudit(adminId, 'supplier.sync', 'supplier', null, result);
-  return {
-    ...result,
-    imported: result.synced,
-    updated: result.synced,
-    message: `Supplier catalog synchronized: ${result.synced} products processed.`,
-  };
+  const startedAt = Date.now();
+  const { data: syncLog, error: logError } = await supabase
+    .from('supplier_sync_logs')
+    .insert({ admin_id: adminId, status: 'running' })
+    .select()
+    .single();
+  fail(logError, 'start supplier synchronization log');
+
+  try {
+    const result = await catalogService.syncCatalog();
+    const now = new Date().toISOString();
+    const durationMs = Date.now() - startedAt;
+    const { error } = await supabase
+      .from('app_settings')
+      .update({ last_supplier_sync_at: now, updated_at: now })
+      .eq('id', SETTINGS_ID);
+    fail(error, 'record supplier synchronization');
+    const { error: syncLogError } = await supabase
+      .from('supplier_sync_logs')
+      .update({
+        status: 'success',
+        imported_count: Number(result.imported || result.synced || 0),
+        updated_count: Number(result.updated || result.synced || 0),
+        processed_count: Number(result.synced || 0),
+        duration_ms: durationMs,
+        details: result,
+        completed_at: now,
+      })
+      .eq('id', syncLog.id);
+    fail(syncLogError, 'finish supplier synchronization log');
+    await writeAudit(adminId, 'supplier.sync', 'supplier', syncLog.id, result);
+    return {
+      ...result,
+      imported: result.imported || result.synced,
+      updated: result.updated || result.synced,
+      duration_ms: durationMs,
+      sync_id: syncLog.id,
+      message: `Supplier catalog synchronized: ${result.synced} products processed.`,
+    };
+  } catch (error) {
+    await supabase
+      .from('supplier_sync_logs')
+      .update({
+        status: 'failed',
+        duration_ms: Date.now() - startedAt,
+        error_code: error.code || 'SUPPLIER_SYNC_FAILED',
+        error_message: String(error.message || 'Supplier synchronization failed').slice(0, 1000),
+        completed_at: new Date().toISOString(),
+      })
+      .eq('id', syncLog.id);
+    throw error;
+  }
+}
+
+async function getSupplierSyncHistory(limit = 50) {
+  const { data, error } = await supabase
+    .from('supplier_sync_logs')
+    .select('*,admin:users!supplier_sync_logs_admin_id_fkey(email)')
+    .order('started_at', { ascending: false })
+    .limit(Math.min(Math.max(Number(limit) || 50, 1), 200));
+  fail(error, 'load supplier synchronization history');
+  return data || [];
+}
+
+async function listAuditLogs(limit = 100) {
+  const { data, error } = await supabase
+    .from('admin_audit_logs')
+    .select('*,admin:users!admin_audit_logs_admin_id_fkey(email)')
+    .order('created_at', { ascending: false })
+    .limit(Math.min(Math.max(Number(limit) || 100, 1), 500));
+  fail(error, 'load administrator audit logs');
+  return data || [];
+}
+
+async function listOperationalLogs(level, limit) {
+  return operationsService.list({ level, limit });
 }
 
 async function uploadImage(adminId, file) {
@@ -625,6 +1062,7 @@ async function uploadImage(adminId, file) {
 module.exports = {
   getAdminMe,
   getOverview,
+  getReports,
   listProducts,
   createProduct,
   updateProduct,
@@ -638,10 +1076,14 @@ module.exports = {
   listUsers,
   updateUser,
   createAdmin,
+  updateAdminAccount,
   getSettings,
   getPublicSettings,
   updateSettings,
   getSupplierStatus,
   syncSupplier,
+  getSupplierSyncHistory,
+  listAuditLogs,
+  listOperationalLogs,
   uploadImage,
 };

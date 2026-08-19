@@ -4,6 +4,7 @@ const orderServicePath = require.resolve('../services/orderService');
 const supplierPath = require.resolve('../services/supplierApi');
 const catalogPath = require.resolve('../services/catalogService');
 const storePath = require.resolve('../db/db');
+const notificationPath = require.resolve('../services/notificationService');
 
 function loadOrderService({ supplier, catalog, store }) {
   delete require.cache[orderServicePath];
@@ -25,6 +26,12 @@ function loadOrderService({ supplier, catalog, store }) {
     loaded: true,
     exports: store,
   };
+  require.cache[notificationPath] = {
+    id: notificationPath,
+    filename: notificationPath,
+    loaded: true,
+    exports: { async notifyOrder() {} },
+  };
   return require(orderServicePath);
 }
 
@@ -33,6 +40,9 @@ function createStore({ insufficient = false } = {}) {
   const ledger = { debits: 0, credits: 0 };
   return {
     ledger,
+    async getUserById(id) {
+      return { id, customer_type: 'retail', disabled: false };
+    },
     async getOrderByClientRequest(userId, requestId) {
       return Array.from(orders.values()).find(
         (order) =>

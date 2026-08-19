@@ -25,10 +25,32 @@ function throwIfError(error, context) {
 
 // ---- Users ----
 
-async function createUser({ id, email, passwordHash }) {
+async function createUser({
+  id,
+  email = null,
+  passwordHash,
+  phoneE164 = null,
+  authProvider = 'password',
+  googleSub = null,
+  displayName = null,
+  emailVerified = false,
+  phoneVerified = false,
+}) {
+  const row = {
+    id,
+    email,
+    password_hash: passwordHash,
+    phone_e164: phoneE164,
+    auth_provider: authProvider,
+    google_sub: googleSub,
+    display_name: displayName,
+    email_verified: Boolean(emailVerified),
+    email_verified_at: emailVerified ? new Date().toISOString() : null,
+    phone_verified_at: phoneVerified ? new Date().toISOString() : null,
+  };
   const { data, error } = await supabase
     .from('users')
-    .insert({ id, email, password_hash: passwordHash })
+    .insert(row)
     .select()
     .single();
   throwIfError(error, 'createUser');
@@ -36,6 +58,7 @@ async function createUser({ id, email, passwordHash }) {
 }
 
 async function getUserByEmail(email) {
+  if (!email) return null;
   // .ilike without wildcards = exact match, case-insensitive.
   const { data, error } = await supabase
     .from('users')
@@ -43,6 +66,28 @@ async function getUserByEmail(email) {
     .ilike('email', email)
     .maybeSingle();
   throwIfError(error, 'getUserByEmail');
+  return data;
+}
+
+async function getUserByPhone(phoneE164) {
+  if (!phoneE164) return null;
+  const { data, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('phone_e164', phoneE164)
+    .maybeSingle();
+  throwIfError(error, 'getUserByPhone');
+  return data;
+}
+
+async function getUserByGoogleSub(googleSub) {
+  if (!googleSub) return null;
+  const { data, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('google_sub', googleSub)
+    .maybeSingle();
+  throwIfError(error, 'getUserByGoogleSub');
   return data;
 }
 
@@ -55,6 +100,87 @@ async function getUserById(id) {
 async function updateUser(id, patch) {
   const { data, error } = await supabase.from('users').update(patch).eq('id', id).select().maybeSingle();
   throwIfError(error, 'updateUser');
+  return data;
+}
+
+async function invalidateAuthTokens(userId, purpose) {
+  const { error } = await supabase
+    .from('auth_tokens')
+    .update({ used_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .eq('purpose', purpose)
+    .is('used_at', null);
+  throwIfError(error, 'invalidateAuthTokens');
+}
+
+async function createAuthToken({ userId, purpose, tokenHash, expiresAt }) {
+  await invalidateAuthTokens(userId, purpose);
+  const { data, error } = await supabase
+    .from('auth_tokens')
+    .insert({
+      user_id: userId,
+      purpose,
+      token_hash: tokenHash,
+      expires_at: expiresAt,
+    })
+    .select()
+    .single();
+  throwIfError(error, 'createAuthToken');
+  return data;
+}
+
+async function getAuthToken({ userId, purpose, tokenHash }) {
+  const { data, error } = await supabase
+    .from('auth_tokens')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('purpose', purpose)
+    .eq('token_hash', tokenHash)
+    .is('used_at', null)
+    .gt('expires_at', new Date().toISOString())
+    .maybeSingle();
+  throwIfError(error, 'getAuthToken');
+  return data;
+}
+
+async function getActiveAuthToken({ userId, purpose }) {
+  const { data, error } = await supabase
+    .from('auth_tokens')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('purpose', purpose)
+    .is('used_at', null)
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  throwIfError(error, 'getActiveAuthToken');
+  return data;
+}
+
+async function incrementAuthTokenAttempts(id, currentAttempts = 0) {
+  const { error } = await supabase
+    .from('auth_tokens')
+    .update({ failed_attempts: Number(currentAttempts || 0) + 1 })
+    .eq('id', id);
+  throwIfError(error, 'incrementAuthTokenAttempts');
+}
+
+async function consumeAuthToken(id) {
+  const { data, error } = await supabase
+    .from('auth_tokens')
+    .update({ used_at: new Date().toISOString() })
+    .eq('id', id)
+    .is('used_at', null)
+    .select('id')
+    .maybeSingle();
+  throwIfError(error, 'consumeAuthToken');
+  if (!data) {
+    throw Object.assign(new Error('The security code is invalid or expired'), {
+      code: 'INVALID_OR_EXPIRED_CODE',
+      status: 400,
+    });
+  }
   return data;
 }
 
@@ -83,7 +209,7 @@ async function creditWallet(userId, amount, reason) {
     p_amount: Number(amount),
     p_reason: reason,
   });
-  throwIfError(error, 'creditWallet');
+  throwIfError(error, 'creditWallet'); 
   return Number(data);
 }
 
@@ -94,7 +220,7 @@ async function upsertProducts(productList) {
   const supplierIds = productList.map((p) => p.id);
   const { data: existingRows, error: existingError } = await supabase
     .from('products')
-    .select('supplier_product_id,your_price,image_url,price_overridden,image_overridden,is_listed,archived,pricing_mode,custom_markup_percent')
+    .select('supplier_product_id,your_price,reseller_price,image_url,price_overridden,image_overridden,is_listed,archived,pricing_mode,custom_markup_percent')
     .in('supplier_product_id', supplierIds);
   throwIfError(existingError, 'load products before sync');
   const existingBySupplierId = new Map(
@@ -119,12 +245,22 @@ async function upsertProducts(productList) {
     return {
       ...existing,
       supplier_product_id: p.id,
+      supplier_category_id:
+        Number.isFinite(Number(p.parent_id)) && Number(p.parent_id) > 0
+          ? Number(p.parent_id)
+          : null,
       name: p.name,
       category_name: p.category_name,
       category_img: p.category_img || null,
+      image_url: existing.image_url ?? null,
+      image_overridden: existing.image_overridden ?? false,
+      archived: existing.archived ?? false,
       supplier_price: p.supplier_price,
       supplier_price_updated_at: now,
       your_price: customerPrice,
+      // Supplier sync never overwrites the administrator's reseller price.
+      // New products safely start at the retail price until it is customized.
+      reseller_price: existing.reseller_price ?? customerPrice,
       pricing_mode: pricingMode,
       custom_markup_percent: pricingMode === pricingService.PRICING_MODES.PERCENTAGE
         ? existing.custom_markup_percent
@@ -138,9 +274,16 @@ async function upsertProducts(productList) {
       updated_at: now,
     };
   });
+  const safeRows = rows.map((row) => ({
+    ...row,
+    image_overridden: row.image_overridden ?? false,
+    price_overridden: row.price_overridden ?? false,
+    is_listed: row.is_listed ?? false,
+    archived: row.archived ?? false,
+  }));
   const { data, error } = await supabase
     .from('products')
-    .upsert(rows, { onConflict: 'supplier_product_id' })
+    .upsert(safeRows, { onConflict: 'supplier_product_id' })
     .select();
   throwIfError(error, 'upsertProducts');
   return data.length;
@@ -176,6 +319,8 @@ async function createOrder(order) {
       extra_params: order.extra_params,
       your_price: order.your_price,
       supplier_price: order.supplier_price,
+      customer_type: order.customer_type || 'retail',
+      unit_price: order.unit_price,
       status: order.status,
       supplier_order_id: order.supplier_order_id,
     })
@@ -251,8 +396,16 @@ module.exports = {
   listOrdersByUser,
   createUser,
   getUserByEmail,
+  getUserByPhone,
+  getUserByGoogleSub,
   getUserById,
   updateUser,
+  createAuthToken,
+  getAuthToken,
+  getActiveAuthToken,
+  incrementAuthTokenAttempts,
+  consumeAuthToken,
+  invalidateAuthTokens,
   getAppSettings,
   debitWallet,
   creditWallet,

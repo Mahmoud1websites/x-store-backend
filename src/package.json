@@ -1,16 +1,19 @@
 {
   "name": "x-store-backend",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "description": "Secure API for the X Store mobile app and administration dashboard",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
     "dev": "nodemon app.js",
-    "check": "node scripts/check-syntax.js"
+    "check": "node scripts/check-syntax.js",
+    "check:env": "node scripts/check-production-env.js",
+    "test:pricing": "node scripts/check-pricing-flow.js",
+    "test:wallet": "node scripts/check-wallet-order-flow.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.55.0",

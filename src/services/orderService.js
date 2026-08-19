@@ -18,7 +18,9 @@
 const crypto = require('crypto');
 const supplierApi = require('./supplierApi');
 const catalogService = require('./catalogService');
+const pricingService = require('./pricingService');
 const store = require('../db/db');
+const notifications = require('./notificationService');
 
 async function debitHook(userId, amount, reason) {
   return store.debitWallet(userId, amount, reason);
@@ -65,12 +67,22 @@ async function placeOrder({
   if (existingOrder) return existingOrder;
 
   const product = await catalogService.getProductOrThrow(productId);
+  const customer = await store.getUserById(userId);
+  if (!customer || customer.disabled) {
+    throw Object.assign(new Error('Customer account is unavailable'), {
+      code: 'CUSTOMER_UNAVAILABLE',
+    });
+  }
   catalogService.validateProductForSale(product);
   catalogService.validateQty(product, qty);
   const validatedParams = catalogService.validateExtraParams(product, extraParams);
 
   const orderUuid = crypto.randomUUID();
-  const yourPrice = Number(product.your_price) * Number(qty);
+  const effectivePrice = pricingService.priceForCustomer(
+    product,
+    customer.customer_type,
+  );
+  const yourPrice = Number(effectivePrice.unit_price) * Number(qty);
   if (!Number.isFinite(yourPrice) || yourPrice <= 0) {
     throw Object.assign(new Error('Product price is invalid'), { code: 'INVALID_PRODUCT_PRICE' });
   }
@@ -88,6 +100,8 @@ async function placeOrder({
       extra_params: validatedParams,
       your_price: yourPrice,
       supplier_price: Number(product.supplier_price) * Number(qty),
+      customer_type: effectivePrice.customer_type,
+      unit_price: effectivePrice.unit_price,
       status: 'payment_pending',
       supplier_order_id: null,
     });
@@ -150,6 +164,10 @@ async function placeOrder({
     updated = await refundOrder(updated);
   }
 
+  await notifications.notifyOrder(updated).catch((notificationError) => {
+    console.error('[orderService] order updated but notification failed:', notificationError.message);
+  });
+
   return updated;
 }
 
@@ -181,6 +199,7 @@ async function recheckOrder(orderUuid, userId = null) {
   if (!supplierOrder) return order; // nothing to update yet
   if (!['accept', 'reject', 'wait'].includes(supplierOrder.status)) return order;
 
+  const previousStatus = order.status;
   let updated = await store.updateOrder(orderUuid, {
     status: supplierOrder.status,
     supplier_order_id: supplierOrder.order_id,
@@ -189,6 +208,12 @@ async function recheckOrder(orderUuid, userId = null) {
 
   if (supplierOrder.status === 'reject') {
     updated = await refundOrder(updated);
+  }
+
+  if (updated.status !== previousStatus) {
+    await notifications.notifyOrder(updated).catch((notificationError) => {
+      console.error('[orderService] order updated but notification failed:', notificationError.message);
+    });
   }
 
   return updated;

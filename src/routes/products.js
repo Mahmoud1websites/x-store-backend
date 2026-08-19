@@ -5,9 +5,9 @@ const requireAuth = require('../middleware/requireAuth');
 const requireAdmin = require('../middleware/requireAdmin');
 
 // GET /api/products - list what the app should show to users
-router.get('/', async (req, res) => {
+router.get('/', requireAuth, async (req, res) => {
   try {
-    const products = await catalogService.listAvailableProducts();
+    const products = await catalogService.listAvailableProducts(req.user.customer_type);
     res.json({ status: 'OK', data: products });
   } catch (err) {
     res.status(500).json({ status: 'ERROR', message: err.message });

@@ -14,8 +14,10 @@ const optionalImageUrl = z.union([z.string().url(), z.literal('')]).optional();
 const productFields = {
   name: z.string().trim().min(2).max(160),
   supplier_product_id: z.union([z.string().trim().min(1), z.number()]).optional(),
+  supplier_category_id: z.coerce.number().int().positive().nullable().optional(),
   category_name: z.string().trim().min(1).max(120).optional(),
   your_price: z.coerce.number().min(0).optional(),
+  reseller_price: z.coerce.number().min(0).optional(),
   pricing_mode: z.enum(['global', 'percentage', 'fixed']).optional(),
   custom_markup_percent: z.coerce.number().min(0).max(1000).nullable().optional(),
   image_url: optionalImageUrl,
@@ -35,6 +37,7 @@ const categorySchema = z.object({
   description: z.string().trim().max(500).optional(),
   image_url: optionalImageUrl,
   visible: z.boolean().optional(),
+  sort_order: z.coerce.number().int().min(0).max(100000).optional(),
 }).refine((value) => Object.keys(value).length > 0, 'At least one field is required');
 const orderSchema = z.object({
   status: z.enum(['pending_supplier', 'wait', 'reject']).optional(),
@@ -44,8 +47,15 @@ const orderSchema = z.object({
 const userSchema = z.object({
   wallet_balance: z.coerce.number().min(0).optional(),
   disabled: z.boolean().optional(),
+  customer_type: z.enum(['retail', 'reseller']).optional(),
   audit_reason: z.string().trim().min(3).max(500),
-}).refine((value) => value.wallet_balance !== undefined || value.disabled !== undefined, 'Nothing to update');
+}).refine(
+  (value) =>
+    value.wallet_balance !== undefined
+    || value.disabled !== undefined
+    || value.customer_type !== undefined,
+  'Nothing to update',
+);
 const settingsSchema = z.object({
   exchange_rate: z.coerce.number().positive().optional(),
   default_markup_percent: z.coerce.number().min(0).max(1000).optional(),
@@ -56,8 +66,27 @@ const settingsSchema = z.object({
 }).refine((value) => Object.keys(value).length > 0, 'At least one field is required');
 const adminSchema = z.object({
   email: z.string().trim().email(),
-  password: z.string().min(10).max(128),
+  password: z.string()
+    .min(12)
+    .max(128)
+    .regex(/[a-z]/, 'Password must include a lowercase letter')
+    .regex(/[A-Z]/, 'Password must include an uppercase letter')
+    .regex(/\d/, 'Password must include a number'),
 });
+const adminAccountSchema = z.object({
+  current_password: z.string().min(1).max(128),
+  email: z.string().trim().email().optional(),
+  password: z.string()
+    .min(12)
+    .max(128)
+    .regex(/[a-z]/, 'Password must include a lowercase letter')
+    .regex(/[A-Z]/, 'Password must include an uppercase letter')
+    .regex(/\d/, 'Password must include a number')
+    .optional(),
+}).refine(
+  (value) => value.email !== undefined || value.password !== undefined,
+  'Enter a new email or password',
+);
 const bulkListingSchema = z.object({
   product_ids: z.array(z.union([z.string().min(1), z.number()])).min(1).max(500),
   is_listed: z.boolean(),
@@ -112,8 +141,23 @@ function handler(action) {
   };
 }
 
+const accountLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 router.get('/me', handler((req) => adminService.getAdminMe(req.user)));
+router.patch('/account', accountLimiter, handler((req) =>
+  adminService.updateAdminAccount(req.user.id, parse(adminAccountSchema, req.body))
+));
 router.get('/overview', handler(() => adminService.getOverview()));
+router.get('/reports', handler((req) => adminService.getReports(req.query.days)));
+router.get('/audit-logs', handler((req) => adminService.listAuditLogs(req.query.limit)));
+router.get('/operations/logs', handler((req) =>
+  adminService.listOperationalLogs(req.query.level, req.query.limit)
+));
 router.get('/products', handler((req) => adminService.listProducts(req.query.search)));
 router.post('/products', handler((req) => adminService.createProduct(req.user.id, parse(createProductSchema, req.body))));
 router.patch('/products/bulk-listing', handler((req) => {
@@ -135,7 +179,9 @@ router.patch('/orders/:id', handler((req) => adminService.updateOrder(req.user.i
 
 router.get('/users', handler((req) => adminService.listUsers(req.query.search)));
 router.patch('/users/:id', handler((req) => adminService.updateUser(req.user.id, req.params.id, parse(userSchema, req.body))));
-router.post('/admins', handler((req) => adminService.createAdmin(req.user.id, parse(adminSchema, req.body))));
+router.post('/admins', accountLimiter, handler((req) =>
+  adminService.createAdmin(req.user.id, parse(adminSchema, req.body))
+));
 
 router.get('/wallet-topups', handler((req) => walletService.listForAdmin(req.query.status)));
 router.patch('/wallet-topups/:id', handler((req) =>
@@ -148,6 +194,7 @@ router.patch('/wallet-topups/:id', handler((req) =>
 
 const supplierLimiter = rateLimit({ windowMs: 60_000, limit: 3, standardHeaders: true, legacyHeaders: false });
 router.get('/supplier/status', handler(() => adminService.getSupplierStatus()));
+router.get('/supplier/history', handler((req) => adminService.getSupplierSyncHistory(req.query.limit)));
 router.post('/supplier/sync', supplierLimiter, handler((req) => adminService.syncSupplier(req.user.id)));
 
 router.get('/settings', handler(() => adminService.getSettings()));

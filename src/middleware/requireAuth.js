@@ -21,7 +21,7 @@ async function requireAuth(req, res, next) {
 
   try {
     const payload = authService.verifyToken(token);
-    const user = await authService.getMe(payload.sub);
+    const user = await authService.getSessionUser(payload);
     if (user.disabled) {
       return res.status(403).json({
         status: 'ERROR',

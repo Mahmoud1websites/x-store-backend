@@ -4,10 +4,10 @@
 begin;
 
 alter table public.app_settings
-  add column if not exists whish_phone text not null default '+96179306701';
+  add column if not exists whish_phone text not null default '+96176345701';
 
 update public.app_settings
-set whish_phone = '+96179306701'
+set whish_phone = '+96176345701'
 where id = 1 and length(trim(coalesce(whish_phone, ''))) = 0;
 
 alter table public.orders

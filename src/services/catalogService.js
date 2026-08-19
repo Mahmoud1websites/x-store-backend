@@ -38,9 +38,30 @@ async function syncCatalog() {
   return { synced: count, global_markup_percent: marginPercent };
 }
 
-async function listAvailableProducts() {
+function productForCustomer(product, customerType) {
+  const price = pricingService.priceForCustomer(product, customerType);
+  // Internal cost and alternative-tier values never leave the backend.
+  const {
+    supplier_price,
+    reseller_price,
+    pricing_mode,
+    custom_markup_percent,
+    price_overridden,
+    supplier_price_updated_at,
+    ...publicProduct
+  } = product;
+  return {
+    ...publicProduct,
+    your_price: price.unit_price,
+    price_tier: price.customer_type,
+  };
+}
+
+async function listAvailableProducts(customerType = 'retail') {
   const all = await store.listProducts();
-  return all.filter((p) => p.available && p.is_listed && !p.archived);
+  return all
+    .filter((p) => p.available && p.is_listed && !p.archived)
+    .map((product) => productForCustomer(product, customerType));
 }
 
 async function getProductOrThrow(productId) {
@@ -124,6 +145,7 @@ function validateQty(product, qty) {
 module.exports = {
   syncCatalog,
   listAvailableProducts,
+  productForCustomer,
   getProductOrThrow,
   validateProductForSale,
   validateExtraParams,

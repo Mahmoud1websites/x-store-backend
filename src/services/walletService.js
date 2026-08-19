@@ -1,4 +1,5 @@
 const supabase = require('../db/supabaseClient');
+const notifications = require('./notificationService');
 
 function databaseError(error, context) {
   if (!error) return;
@@ -68,7 +69,11 @@ async function createForUser(user, input) {
   return {
     request: normalizeRequest(request),
     reused,
-    whish_phone: settings.whish_phone || settings.support_phone || '+96179306701',
+    whish_phone:
+      settings.whish_phone
+      || settings.support_phone
+      || process.env.XSTORE_WHISH_PHONE
+      || '+96176345701',
     exchange_rate: Number(settings.exchange_rate || 89500),
   };
 }
@@ -95,7 +100,7 @@ async function cancelForUser(userId, requestId) {
 async function listForAdmin(status = 'pending') {
   let query = supabase
     .from('wallet_topup_requests')
-    .select('*,user:users!wallet_topup_requests_user_id_fkey(email,wallet_balance)')
+    .select('*,user:users!wallet_topup_requests_user_id_fkey(email,phone_e164,display_name,wallet_balance)')
     .order('created_at', { ascending: false })
     .limit(500);
   if (status && status !== 'all') query = query.eq('status', status);
@@ -127,6 +132,9 @@ async function reviewByAdmin(adminId, requestId, input) {
     notFound.status = 404;
     throw notFound;
   }
+  await notifications.notifyWalletReview(row).catch((notificationError) => {
+    console.error('[walletService] wallet updated but notification failed:', notificationError.message);
+  });
   return normalizeRequest(row);
 }
 
