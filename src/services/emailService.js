@@ -1,5 +1,11 @@
 const RESEND_ENDPOINT = 'https://api.resend.com/emails';
 
+// Publicly hosted logo URL. Must be reachable over the internet — email
+// clients fetch this image directly, they cannot see local files. Update
+// this if the logo is hosted somewhere other than your backend's /public
+// static folder (e.g. Supabase Storage, S3, etc).
+const LOGO_URL = process.env.EMAIL_LOGO_URL || 'https://xstore.best/public/logo.png';
+
 function isConfigured() {
   return Boolean(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
 }
@@ -65,6 +71,7 @@ async function sendAuthCode({ to, code, purpose }) {
     html: `
       <div style="font-family:Arial,sans-serif;background:#f5f6fb;padding:32px;color:#151925">
         <div style="max-width:520px;margin:auto;background:#fff;border:1px solid #e2e5ee;border-radius:20px;padding:30px">
+          <img src="${LOGO_URL}" alt="X Store" style="height:44px;display:block;margin:0 0 18px" />
           <div style="font-size:12px;font-weight:800;letter-spacing:1.6px;color:#4f46e5">X STORE SECURITY</div>
           <h1 style="font-size:26px;margin:18px 0 10px">${heading}</h1>
           <p style="color:#697083;line-height:1.6">${action}</p>

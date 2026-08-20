@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const crypto = require('crypto');
+const path = require('path');
 
 const { validateEnvironment } = require('./config/env');
 validateEnvironment();
@@ -24,13 +25,7 @@ const operationsService = require('./services/operationsService');
 const app = express();
 app.set('trust proxy', 1);
 
-
-
-
-
-
-
-
+app.use('/public', express.static(path.join(__dirname, 'public')));
 
 const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:4173,http://127.0.0.1:4173,http://localhost:5173,http://127.0.0.1:5173')
   .split(',')

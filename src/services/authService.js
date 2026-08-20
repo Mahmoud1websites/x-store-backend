@@ -98,7 +98,17 @@ async function register({ email, password }) {
 
   const passwordHash = await bcrypt.hash(password, 12);
   const user = await store.createUser({ id: crypto.randomUUID(), email: normalizedEmail, passwordHash });
-  const delivery = await createAndSendCode(user, 'email_verification');
+
+  // The user row is already created at this point. Don't let a flaky email
+  // provider fail the whole registration — the client can always request a
+  // new code from the verify-email screen.
+  let delivery = {};
+  try {
+    delivery = await createAndSendCode(user, 'email_verification');
+  } catch (error) {
+    console.error('[authService] Verification email delivery failed on register:', error.code || error.message);
+  }
+
   return {
     email: user.email,
     requires_email_verification: true,
