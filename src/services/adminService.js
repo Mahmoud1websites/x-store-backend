@@ -344,9 +344,24 @@ async function createProduct(adminId, input) {
   // Manual products get a synthetic negative id (no real provider behind
   // them). Non-manual products (e.g. TopUpApp) must use the provider's
   // own product id so orderService can call their API with it directly.
-  const supplierProductId = isManual
-    ? (input.supplier_product_id || -Date.now())
-    : input.supplier_product_id;
+
+// supplier_product_id is the table's PRIMARY KEY, shared across every
+// supplier. Kamal Cell and TopUpApp each hand out their own small
+// integer IDs independently, so trusting either supplier's raw ID
+// directly as the PK risks collisions (e.g. both suppliers may have
+// a product "654"). Manual products already avoid this with a
+// synthetic negative ID; TopUpApp products get the same treatment —
+// a large, distinct synthetic PK — while the real TopUpApp ID needed
+// to call their API is kept separately in provider_product_id.
+const supplierProductId = isManual
+  ? (input.supplier_product_id || -Date.now())
+  : supplierSource === 'topupapp'
+    ? 9_000_000_000_000 + Date.now()
+    : input.supplier_product_id; // Kamal Cell IDs are trusted as-is (unchanged)
+const providerProductId = supplierSource === 'topupapp'
+  ? String(input.supplier_product_id)
+  : null;
+
   // TopUpApp direct-recharge products are always quantity-locked to 1
   // (qty_values: null enforces exactly qty=1 in catalogService.validateQty)
   // and always collect a phone number, unless the admin specified other
@@ -357,6 +372,7 @@ async function createProduct(adminId, input) {
 
   const row = {
     supplier_product_id: supplierProductId,
+    provider_product_id: providerProductId,
     name: input.name,
     category_name: input.category_name || 'Other',
     supplier_category_id: input.supplier_category_id ?? null,

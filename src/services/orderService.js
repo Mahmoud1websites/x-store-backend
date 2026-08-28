@@ -191,12 +191,13 @@ async function placeOrder({
   try {
     if (isTopUpApp) {
       result = await rechargeApi.newOrder({
-        productId,
+        productId: product.provider_product_id,
         qty,
         orderUuid,
         isDirectRecharge: true,
         phoneNumber,
       });
+
     } else {
       result = await supplierApi.newOrder({
         productId,
