@@ -18,14 +18,37 @@ const FALLBACK_MARGIN_PERCENT = Number(process.env.MARGIN_PERCENT || 10);
  * Pulls the full catalog from the supplier and upserts it locally.
  * Run this on a schedule (e.g. every 15-30 min) via a cron job,
  * and also on-demand from an admin "refresh catalog" button.
+ *
+ * IMPORTANT: products you've manually converted to product_type
+ * 'manual' (e.g. Shahid, Netflix, OSN, Prime, Watch It — subscriptions
+ * you fulfill yourself with an external supplier, not through Kamal
+ * Cell's API) are excluded from this sync even though Kamal Cell's
+ * catalog still lists them under the same supplier_product_id. Without
+ * this exclusion, every sync would silently overwrite your manual
+ * setup back to an automated Kamal Cell product and any customer order
+ * placed afterward would go to the wrong fulfillment flow.
  */
 async function syncCatalog() {
-  const [supplierProducts, settings] = await Promise.all([
+  const [supplierProducts, settings, localProducts] = await Promise.all([
     supplierApi.getProducts(),
     store.getAppSettings(),
+    store.listProducts(),
   ]);
+
+  const manualSupplierIds = new Set(
+    localProducts
+      .filter((product) => product.product_type === 'manual')
+      .map((product) => String(product.supplier_product_id))
+      .filter((id) => id !== 'undefined' && id !== 'null'),
+  );
+
+  const syncable = supplierProducts.filter(
+    (p) => !manualSupplierIds.has(String(p.supplier_product_id ?? p.id)),
+  );
+  const skippedManualCount = supplierProducts.length - syncable.length;
+
   const marginPercent = Number(settings.default_markup_percent ?? FALLBACK_MARGIN_PERCENT);
-  const withMargin = supplierProducts.map((p) => ({
+  const withMargin = syncable.map((p) => ({
     ...p,
     supplier_price: Number(p.price),
     your_price: pricingService.calculateCustomerPrice({
@@ -35,7 +58,11 @@ async function syncCatalog() {
     }),
   }));
   const count = await store.upsertProducts(withMargin);
-  return { synced: count, global_markup_percent: marginPercent };
+  return {
+    synced: count,
+    global_markup_percent: marginPercent,
+    skipped_manual: skippedManualCount,
+  };
 }
 
 function productForCustomer(product, customerType) {
