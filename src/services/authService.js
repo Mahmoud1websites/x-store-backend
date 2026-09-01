@@ -7,14 +7,29 @@ const notifications = require('./notificationService');
 const authProviders = require('./authProviderService');
 const pushService = require('./pushService');
 
+
 const JWT_SECRET = process.env.JWT_SECRET || (() => {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('JWT_SECRET must be set in production');
+  }
   console.warn('[authService] JWT_SECRET is not set; using a temporary development-only secret.');
   return crypto.randomBytes(32).toString('hex');
 })();
+
+
+
+
 const AUTH_CODE_PEPPER = process.env.AUTH_CODE_PEPPER || (() => {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('AUTH_CODE_PEPPER must be set in production');
+  }
   console.warn('[authService] AUTH_CODE_PEPPER is not set; using a temporary development-only pepper.');
   return crypto.randomBytes(32).toString('hex');
 })();
+
+
+
+
 const TOKEN_EXPIRY = '30d';
 const CODE_EXPIRY_MS = 15 * 60 * 1000;
 

@@ -65,12 +65,12 @@ const categorySchema = z.object({
   sort_order: z.coerce.number().int().min(0).max(100000).optional(),
 }).refine((value) => Object.keys(value).length > 0, 'At least one field is required');
 
-
 const orderSchema = z.object({
   status: z.enum(['pending_supplier', 'wait', 'reject', 'fulfilled']).optional(),
   admin_note: z.string().trim().max(1000).optional(),
   audit_reason: z.string().trim().min(3).max(500),
   manual_credentials: z.object({
+    message: z.string().trim().max(2000).optional().default(''),
     username: z.string().trim().max(160).optional().default(''),
     email: z.string().trim().max(160).optional().default(''),
     password: z.string().trim().max(160).optional().default(''),
@@ -78,13 +78,16 @@ const orderSchema = z.object({
   }).optional(),
 }).refine(
   (value) => value.status !== 'fulfilled' || (
-    value.manual_credentials
-    && (value.manual_credentials.username || value.manual_credentials.email)
-    && value.manual_credentials.password
+    value.manual_credentials && (
+      value.manual_credentials.message
+      || (
+        (value.manual_credentials.username || value.manual_credentials.email)
+        && value.manual_credentials.password
+      )
+    )
   ),
-  { message: 'Credentials (username or email, plus password) are required to mark an order fulfilled' },
+  { message: 'Account details message (or username/email + password) are required to mark an order fulfilled' },
 );
-
 
 
 

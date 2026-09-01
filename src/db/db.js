@@ -23,6 +23,23 @@ function throwIfError(error, context) {
   }
 }
 
+// Some suppliers send a generic/incorrect field label (e.g. "Phone Number")
+// for products that actually need a game Player ID. Override by keyword
+// match against the category or product name, regardless of what the
+// supplier sends, so the checkout screen shows the right field.
+const PARAM_LABEL_OVERRIDES = [
+  { match: /pubg/i, params: ['Player ID'] },
+  { match: /free ?fire/i, params: ['Player ID'] },
+  { match: /mobile legends/i, params: ['User ID', 'Zone ID'] },
+  // add more game categories here as needed
+];
+
+function resolveParams(p) {
+  const haystack = `${p.category_name || ''} ${p.name || ''}`;
+  const override = PARAM_LABEL_OVERRIDES.find((rule) => rule.match.test(haystack));
+  return override ? override.params : p.params;
+}
+
 // ---- Users ----
 
 async function createUser({
@@ -268,7 +285,7 @@ async function upsertProducts(productList) {
       price_overridden: pricingMode !== pricingService.PRICING_MODES.GLOBAL,
       product_type: p.product_type,
       qty_values: p.qty_values,
-      params: p.params,
+      params: resolveParams(p),
       is_listed: existing.is_listed ?? false,
       available: existing.archived ? false : p.available,
       updated_at: now,
