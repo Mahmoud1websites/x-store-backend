@@ -345,22 +345,22 @@ async function createProduct(adminId, input) {
   // them). Non-manual products (e.g. TopUpApp) must use the provider's
   // own product id so orderService can call their API with it directly.
 
-// supplier_product_id is the table's PRIMARY KEY, shared across every
-// supplier. Kamal Cell and TopUpApp each hand out their own small
-// integer IDs independently, so trusting either supplier's raw ID
-// directly as the PK risks collisions (e.g. both suppliers may have
-// a product "654"). Manual products already avoid this with a
-// synthetic negative ID; TopUpApp products get the same treatment —
-// a large, distinct synthetic PK — while the real TopUpApp ID needed
-// to call their API is kept separately in provider_product_id.
-const supplierProductId = isManual
-  ? (input.supplier_product_id || -Date.now())
-  : supplierSource === 'topupapp'
-    ? 9_000_000_000_000 + Date.now()
-    : input.supplier_product_id; // Kamal Cell IDs are trusted as-is (unchanged)
-const providerProductId = supplierSource === 'topupapp'
-  ? String(input.supplier_product_id)
-  : null;
+  // supplier_product_id is the table's PRIMARY KEY, shared across every
+  // supplier. Kamal Cell and TopUpApp each hand out their own small
+  // integer IDs independently, so trusting either supplier's raw ID
+  // directly as the PK risks collisions (e.g. both suppliers may have
+  // a product "654"). Manual products already avoid this with a
+  // synthetic negative ID; TopUpApp products get the same treatment —
+  // a large, distinct synthetic PK — while the real TopUpApp ID needed
+  // to call their API is kept separately in provider_product_id.
+  const supplierProductId = isManual
+    ? (input.supplier_product_id || -Date.now())
+    : supplierSource === 'topupapp'
+      ? 9_000_000_000_000 + Date.now()
+      : input.supplier_product_id; // Kamal Cell IDs are trusted as-is (unchanged)
+  const providerProductId = supplierSource === 'topupapp'
+    ? String(input.supplier_product_id)
+    : null;
 
   // TopUpApp direct-recharge products are always quantity-locked to 1
   // (qty_values: null enforces exactly qty=1 in catalogService.validateQty)
@@ -754,10 +754,15 @@ async function findOrder(identifier) {
  * manual product before allowing an admin to attach credentials.
  */
 async function findProductForOrder(order) {
+  const productId = String(order.product_id);
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(productId);
+  const filter = isUuid
+    ? `id.eq.${productId},supplier_product_id.eq.${productId}`
+    : `supplier_product_id.eq.${productId}`;
   const { data, error } = await supabase
     .from('products')
     .select('id,supplier_product_id,name,product_type')
-    .or(`id.eq.${order.product_id},supplier_product_id.eq.${order.product_id}`)
+    .or(filter)
     .maybeSingle();
   fail(error, 'load product for order');
   return data || null;
